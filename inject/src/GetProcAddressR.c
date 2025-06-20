@@ -1,4 +1,3 @@
-//===============================================================================================//
 // Copyright (c) 2013, Stephen Fewer of Harmony Security (www.harmonysecurity.com)
 // All rights reserved.
 //
@@ -27,96 +26,88 @@
 //===============================================================================================//
 #include "GetProcAddressR.h"
 
-#ifdef __MINGW32__
-#define __try
-#define __except(x) if(0)
-#endif
-
-//===============================================================================================//
-// We implement a minimal GetProcAddress to avoid using the native kernel32!GetProcAddress which
-// wont be able to resolve exported addresses in reflectivly loaded librarys.
-FARPROC WINAPI GetProcAddressR( HANDLE hModule, LPCSTR lpProcName )
+FARPROC WINAPI GetProcAddressR(HANDLE hModule, LPCSTR lpProcName)
 {
-	UINT_PTR uiLibraryAddress = 0;
-	FARPROC fpResult          = NULL;
-
-	if( hModule == NULL )
+	if (!hModule || !lpProcName)
 		return NULL;
 
-	// a module handle is really its base address
-	uiLibraryAddress = (UINT_PTR)hModule;
+	UINT_PTR uiLibraryAddress = (UINT_PTR)hModule;
+	PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)uiLibraryAddress;
+	PIMAGE_NT_HEADERS pNtHeaders = NULL;
+	PIMAGE_EXPORT_DIRECTORY pExportDirectory = NULL;
 
-	__try
+	// STEP 1: Validate the PE headers to ensure we are parsing a valid module.
+	if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+		return NULL;
+
+	pNtHeaders = (PIMAGE_NT_HEADERS)(uiLibraryAddress + pDosHeader->e_lfanew);
+	if (pNtHeaders->Signature != IMAGE_NT_SIGNATURE)
+		return NULL;
+
+	// STEP 2: Locate the Export Address Table (EAT). If the module has no exports, return NULL.
+	PIMAGE_DATA_DIRECTORY pDataDirectory = &pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+	if (pDataDirectory->VirtualAddress == 0)
+		return NULL;
+
+	pExportDirectory = (PIMAGE_EXPORT_DIRECTORY)(uiLibraryAddress + pDataDirectory->VirtualAddress);
+
+	// STEP 3: Get pointers to the three critical arrays within the EAT.
+	// AddressOfFunctions: RVAs to the actual function code.
+	PDWORD pdwAddressArray = (PDWORD)(uiLibraryAddress + pExportDirectory->AddressOfFunctions);
+	// AddressOfNames: RVAs to the function name strings.
+	PDWORD pdwNameArray = (PDWORD)(uiLibraryAddress + pExportDirectory->AddressOfNames);
+	// AddressOfNameOrdinals: An array of WORDs that maps names to ordinals.
+	PWORD pwNameOrdinals = (PWORD)(uiLibraryAddress + pExportDirectory->AddressOfNameOrdinals);
+
+	// STEP 4: Determine if the function is being imported by name or by ordinal.
+	// The IS_INTRESOURCE macro checks if the high-word is zero.
+	if (((DWORD_PTR)lpProcName >> 16) == 0)
 	{
-		UINT_PTR uiAddressArray = 0;
-		UINT_PTR uiNameArray    = 0;
-		UINT_PTR uiNameOrdinals = 0;
-		PIMAGE_NT_HEADERS pNtHeaders             = NULL;
-		PIMAGE_DATA_DIRECTORY pDataDirectory     = NULL;
-		PIMAGE_EXPORT_DIRECTORY pExportDirectory = NULL;
+		// The ordinal is the low-word of the lpProcName parameter.
+		WORD wOrdinal = (WORD)lpProcName;
+		DWORD dwOrdinalBase = pExportDirectory->Base;
 
-		// get the VA of the modules NT Header
-		pNtHeaders = (PIMAGE_NT_HEADERS)(uiLibraryAddress + ((PIMAGE_DOS_HEADER)uiLibraryAddress)->e_lfanew);
+		// Check if the requested ordinal is within the valid range of exported functions.
+		if (wOrdinal < dwOrdinalBase || wOrdinal >= dwOrdinalBase + pExportDirectory->NumberOfFunctions)
+			return NULL;
 
-		pDataDirectory = (PIMAGE_DATA_DIRECTORY)&pNtHeaders->OptionalHeader.DataDirectory[ IMAGE_DIRECTORY_ENTRY_EXPORT ];
+		// The function's RVA is found by indexing the address table with (requested_ordinal - base_ordinal).
+		DWORD dwFunctionRva = pdwAddressArray[wOrdinal - dwOrdinalBase];
 
-		// get the VA of the export directory
-		pExportDirectory = (PIMAGE_EXPORT_DIRECTORY)( uiLibraryAddress + pDataDirectory->VirtualAddress );
+		// An RVA of 0 indicates a gap in the ordinal table (a function that is not implemented).
+		if (dwFunctionRva == 0)
+			return NULL;
 
-		// get the VA for the array of addresses
-		uiAddressArray = ( uiLibraryAddress + pExportDirectory->AddressOfFunctions );
-
-		// get the VA for the array of name pointers
-		uiNameArray = ( uiLibraryAddress + pExportDirectory->AddressOfNames );
-
-		// get the VA for the array of name ordinals
-		uiNameOrdinals = ( uiLibraryAddress + pExportDirectory->AddressOfNameOrdinals );
-
-		// test if we are importing by name or by ordinal...
-		if( (((DWORD_PTR)lpProcName) >> 16) == 0 )
+		// Return the absolute address of the function.
+		return (FARPROC)(uiLibraryAddress + dwFunctionRva);
+	}
+	else
+	{
+		// Iterate through the array of exported function names.
+		for (DWORD i = 0; i < pExportDirectory->NumberOfNames; i++)
 		{
-			// import by ordinal...
+			LPCSTR cpExportedFunctionName = (LPCSTR)(uiLibraryAddress + pdwNameArray[i]);
 
-			// use the import ordinal (- export ordinal base) as an index into the array of addresses
-			uiAddressArray += ( ( IMAGE_ORDINAL( (DWORD)(DWORD_PTR)lpProcName ) - pExportDirectory->Base ) * sizeof(DWORD) );
-
-			// resolve the address for this imported function
-			fpResult = (FARPROC)( uiLibraryAddress + DEREF_32(uiAddressArray) );
-		}
-		else
-		{
-			// import by name...
-			DWORD dwCounter = pExportDirectory->NumberOfNames;
-			while( dwCounter-- )
+			// Perform a case-sensitive string comparison to find a match.
+			if (strcmp(cpExportedFunctionName, lpProcName) == 0)
 			{
-				char * cpExportedFunctionName = (char *)(uiLibraryAddress + DEREF_32( uiNameArray ));
+				// Match found. The index 'i' is the key to link the three arrays.
+				// Use 'i' to get the function's ordinal from the name ordinals array.
+				WORD wFunctionOrdinal = pwNameOrdinals[i];
 
-				// test if we have a match...
-				if( strcmp( cpExportedFunctionName, lpProcName ) == 0 )
-				{
-					// use the functions name ordinal as an index into the array of name pointers
-					uiAddressArray += ( DEREF_16( uiNameOrdinals ) * sizeof(DWORD) );
+				// Use the ordinal to get the function's RVA from the address table.
+				DWORD dwFunctionRva = pdwAddressArray[wFunctionOrdinal];
 
-					// calculate the virtual address for the function
-					fpResult = (FARPROC)(uiLibraryAddress + DEREF_32( uiAddressArray ));
+				// This should not happen for a named export, but as a safeguard.
+				if (dwFunctionRva == 0)
+					return NULL;
 
-					// finish...
-					break;
-				}
-
-				// get the next exported function name
-				uiNameArray += sizeof(DWORD);
-
-				// get the next exported function name ordinal
-				uiNameOrdinals += sizeof(WORD);
+				// Return the absolute address of the function.
+				return (FARPROC)(uiLibraryAddress + dwFunctionRva);
 			}
 		}
 	}
-	__except( EXCEPTION_EXECUTE_HANDLER )
-	{
-		fpResult = NULL;
-	}
 
-	return fpResult;
+	// The requested function was not found in the export table.
+	return NULL;
 }
-//===============================================================================================//

@@ -33,10 +33,7 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <MASM Include="src\GateTrampoline32.asm">
-      <Filter>Source Files</Filter>
-    </MASM>
-    <MASM Include="src\GateTrampoline64.asm">
+    <MASM Include="src\GateTrampolineARM64.asm">
       <Filter>Source Files</Filter>
     </MASM>
   </ItemGroup>
