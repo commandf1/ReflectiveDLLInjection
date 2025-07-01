@@ -1,5 +1,13 @@
 #include "DirectSyscall.h"
 
+//===============================================================================================//
+// The following block of C functions (SyscallStub and all rdi* wrappers) acts as a bridge
+// to our assembly trampolines. Compiler optimizations MUST be disabled for this entire
+// block to ensure a predictable stack frame that the assembly code can correctly parse.
+//
+// Failure to do so can or will break the direct syscall mechanism.
+//===============================================================================================//
+
 #pragma optimize("g", off)
 #ifdef __MINGW32__
 #pragma GCC push_options
@@ -75,7 +83,8 @@ BOOL getSyscalls(PVOID pNtdllBase, Syscall *Syscalls[], DWORD dwSyscallSize)
 		PCHAR FunctionName = (PCHAR)((PBYTE)pNtdllBase + pdwAddrOfNames[dwIdxfName]);
 		if (*(USHORT *)FunctionName == 0x775a) // "Zw" in little-endian
 		{
-			if (SyscallList.dwCount >= MAX_SYSCALLS) break;
+			if (SyscallList.dwCount >= MAX_SYSCALLS)
+				break;
 			SyscallList.Entries[SyscallList.dwCount].dwCryptedHash = _hash(FunctionName);
 			SyscallList.Entries[SyscallList.dwCount].pAddress = (PVOID)((PBYTE)pNtdllBase + pdwAddrOfFunctions[pwAddrOfNameOrdinales[dwIdxfName]]);
 			SyscallList.dwCount++;
@@ -108,8 +117,11 @@ BOOL getSyscalls(PVOID pNtdllBase, Syscall *Syscalls[], DWORD dwSyscallSize)
 
 #if defined(_M_ARM64)
 				// For ARM64, we verify that the function's machine code matches the expected 'svc'
-				// instruction for the given syscall number. This ensures we have an authentic, unhooked stub.
-				// The formula was derived from reverse engineering ntdll.dll on Windows 11 ARM64.
+				// instruction for the given syscall number. The formula was derived from reverse
+				// engineering ntdll.dll on Windows 11 ARM64, which shows a predictable pattern.
+				//   ntdll!ZwAllocateVirtualMemory:
+				//   d4000301  svc  #0x18  ; Syscall number 24 (0x18)
+				//   d65f03c0  ret
 				DWORD expectedOpcode = 0xd4000001 + (i * 0x20);
 				if (*(PDWORD)SyscallList.Entries[i].pAddress == expectedOpcode)
 				{
@@ -118,13 +130,25 @@ BOOL getSyscalls(PVOID pNtdllBase, Syscall *Syscalls[], DWORD dwSyscallSize)
 					Syscalls[dwIdxSyscall]->pStub = SyscallList.Entries[i].pAddress;
 				}
 #else
-				// For x86/x64, the "stub" is a pointer to the 'syscall; ret' gadget
-				// inside the function, which is at a predictable offset. This bypasses API hooks.
-				#if defined(_M_X64)
+				// For x86/x64, the "stub" is a pointer to the 'syscall; ret' gadget inside
+				// the function, which is at a predictable offset. This bypasses API hooks.
+#if defined(_M_X64)
+				// On x64, the function starts like this:
+				//   4C 8B D1        mov r10, rcx
+				//   B8 <num>..      mov eax, <syscall_num>
+				//   0F 05           syscall
+				//   C3              ret
+				// The gadget we jump to is at +8 bytes from the start.
 				Syscalls[dwIdxSyscall]->pStub = (PVOID)((PBYTE)SyscallList.Entries[i].pAddress + 8);
-				#else // _M_IX86
+#else // _M_IX86
+				// On x86, the function starts like this:
+				//   B8 <num>..      mov eax, <syscall_num>
+				//   BA <ptr>..      mov edx, <syscall_dispatch_ptr>
+				//   FF D2           call edx
+				//   C2 0400         ret 4
+				// In ntdll, the call edx points to the 'syscall' instruction. The gadget is at +5 bytes.
 				Syscalls[dwIdxSyscall]->pStub = (PVOID)((PBYTE)SyscallList.Entries[i].pAddress + 5);
-				#endif
+#endif
 #endif
 				break;
 			}
