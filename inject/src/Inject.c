@@ -71,6 +71,7 @@ int main(int argc, char *argv[])
 	HANDLE hThread = NULL;
 	LPVOID lpBuffer = NULL;
 	DWORD dwProcessId = 0;
+  LPVOID lpParameter = NULL;
 	char *cpDllFile = NULL;
 	int exitCode = 1; // Default to error exit code
 
@@ -105,6 +106,12 @@ int main(int argc, char *argv[])
 	{
 		cpDllFile = argv[2];
 	}
+
+  if (argc >= 4)
+  {
+    unsigned long long numericAddress = strtoull(argv[3], NULL, 0);
+    lpParameter = (LPVOID)(uintptr_t)numericAddress;
+  }
 
 	printf("[+] Attempting to inject '%s' into process %ld...\n", cpDllFile, dwProcessId);
 
@@ -152,7 +159,7 @@ int main(int argc, char *argv[])
 	printf("[+] Target process handle obtained: 0x%p\n", hProcess);
 
 	// STAGE 3: Inject the DLL and execute its reflective loader.
-	hThread = LoadRemoteLibraryR(hProcess, lpBuffer, dwLength, "ReflectiveLoader", NULL);
+	hThread = LoadRemoteLibraryR(hProcess, lpBuffer, dwLength, "tim", lpParameter);
 	if (!hThread)
 	{
 		printf("[-] Failed to inject the DLL. LoadRemoteLibraryR failed with error: %ld\n", GetLastError());
